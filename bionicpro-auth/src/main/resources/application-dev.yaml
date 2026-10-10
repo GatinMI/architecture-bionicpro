@@ -1,0 +1,49 @@
+server:
+  port: 8081
+
+spring:
+  application:
+    name: bionicpro-auth
+
+  security:
+    oauth2:
+      client:
+        registration:
+          keycloak:
+            client-id: bionicpro-auth
+            client-secret: grdhgwgwergergh
+            redirect-uri: http://localhost:3000/login/oauth2/code/keycloak
+        provider:
+          keycloak:
+            issuer-uri: http://localhost:8080/realms/reports-realm
+            authorization-uri: http://localhost:8080/realms/reports-realm/protocol/openid-connect/auth
+            jwk-set-uri: http://localhost:8080/realms/reports-realm/protocol/openid-connect/certs
+            user-info-uri: http://localhost:8080/realms/reports-realm/protocol/openid-connect/userinfo
+            token-uri: http://localhost:8080/realms/reports-realm/protocol/openid-connect/token
+
+
+  cloud:
+    gateway:
+      server:
+        webflux:
+          routes:
+            - id: users
+              uri: http://localhost:8083
+              predicates:
+                - Path=/api/users/**
+              filters:
+                - TokenRelay=
+            - id: reports
+              uri: http:/localhost:8082
+              predicates:
+                - Path=/api/reports/**
+              filters:
+                - TokenRelay=
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
+logging:
+  level:
+    org.springframework.security: TRACE

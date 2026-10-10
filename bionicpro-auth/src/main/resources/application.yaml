@@ -1,0 +1,59 @@
+server:
+  reactive:
+    session:
+      timeout: 30m
+      cookie:
+        name: bp_auth
+        http-only: true
+        same-site: Lax
+        secure: true
+        max-age: 1800
+
+spring:
+  application:
+    name: bionicpro-auth
+
+  security:
+    oauth2:
+      client:
+        registration:
+          keycloak:
+            provider: keycloak
+            client-id: ${KEYCLOAK_CLIENT_ID}
+            client-secret: ${KEYCLOAK_CLIENT_SECRET}
+            authorization-grant-type: authorization_code
+            scope: openid, profile, email
+            redirect-uri: ${APP_REDIRECT_URI}
+        provider:
+          keycloak:
+            issuer-uri: ${KEYCLOAK_REALM_URI}
+            authorization-uri: ${KEYCLOAK_AUTHORIZATION_URI}
+            jwk-set-uri: ${KEYCLOAK_JWK_SET_URI}
+            user-info-uri: ${KEYCLOAK_USER_INFO_URI}
+            token-uri: ${KEYCLOAK_TOKEN_URI}
+
+
+
+  cloud:
+    gateway:
+      server:
+        webflux:
+          routes:
+            - id: users
+              uri: ${USER_API_URI}
+              predicates:
+                - Path=/api/users/**
+              filters:
+                - TokenRelay=
+  data:
+    redis:
+      host: ${REDIS_HOST}
+      port: ${REDIS_PORT}
+      timeout: 5000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+

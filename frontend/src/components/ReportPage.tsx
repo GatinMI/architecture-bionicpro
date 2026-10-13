@@ -22,12 +22,56 @@ interface YandexState {
   profile: YandexProfile;
 }
 
+interface DailyMetrics {
+  day: string;
+  avgBatteryLevel: number;
+  minBatteryLevel: number;
+  avgSignalQuality: number;
+  totalMovements: number;
+  totalGestures: number;
+  totalRecognitionErrors: number;
+  maxTemperatureC: number;
+  errorCodes: string[];
+  measurements: number;
+}
+
+interface ProsthesisSummary {
+  days: number;
+  avgBatteryLevel: number;
+  avgSignalQuality: number;
+  totalMovements: number;
+  totalGestures: number;
+  recognitionErrorRate: number;
+  maxTemperatureC: number;
+  errorCodes: string[];
+}
+
+interface ProsthesisReport {
+  prosthesisId: number;
+  serial: string;
+  model: string;
+  summary: ProsthesisSummary;
+  daily: DailyMetrics[];
+}
+
+interface ReportData {
+  customer: { id: number; fullName: string; email: string };
+  period: { from: string; to: string };
+  dataAvailableUntil: string;
+  prostheses: ProsthesisReport[];
+}
+
 const ReportPage: React.FC = () => {
   const [user, setUser] = useState<UserInfo | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [yandex, setYandex] = useState<YandexState | null>(null);
   const [consentBusy, setConsentBusy] = useState(false);
+
+  const [from, setFrom] = useState('');
+  const [to, setTo] = useState('');
+  const [report, setReport] = useState<ReportData | null>(null);
+  const [reportError, setReportError] = useState<string | null>(null);
 
   useEffect(() => {
     const run = async () => {
@@ -112,8 +156,15 @@ const ReportPage: React.FC = () => {
     try {
       setLoading(true);
       setError(null);
+      setReport(null);
+      setReportError(null);
 
-      const response = await fetch('/api/reports', {
+      const params = new URLSearchParams();
+      if (from) params.set('from', from);
+      if (to) params.set('to', to);
+      const qs = params.toString();
+
+      const response = await fetch(`/api/reports${qs ? `?${qs}` : ''}`, {
         credentials: 'include',
       });
 
@@ -124,14 +175,42 @@ const ReportPage: React.FC = () => {
         return;
       }
 
+      if (response.status === 400 || response.status === 404 || response.status === 503) {
+        const body = await response.json().catch(() => null);
+        const message =
+          body?.error === 'period_not_processed'
+            ? `Data is available up to ${body.available_until ?? '—'}. The requested period has not been processed by ETL yet.`
+            : body?.error === 'customer_not_found'
+              ? 'You are not registered as a customer in CRM, so there is no report for you.'
+              : body?.message ?? `Request failed: ${response.status}`;
+        setReportError(message);
+        return;
+      }
+
       if (!response.ok) {
         throw new Error(`Request failed: ${response.status}`);
       }
+
+      const data: ReportData = await response.json();
+      setReport(data);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred');
     } finally {
       setLoading(false);
     }
+  };
+
+  const saveReportAsJson = () => {
+    if (!report) return;
+    const blob = new Blob([JSON.stringify(report, null, 2)], {
+      type: 'application/json',
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `bionicpro-report-${report.period.from}_${report.period.to}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   if (!user) {
@@ -155,7 +234,7 @@ const ReportPage: React.FC = () => {
 
   return (
     <div className="flex flex-col items-center justify-center min-h-screen bg-gray-100">
-      <div className="p-8 bg-white rounded-lg shadow-md w-full max-w-2xl">
+      <div className="p-8 bg-white rounded-lg shadow-md w-full max-w-4xl">
         <div className="flex items-center justify-between mb-6">
           <h1 className="text-2xl font-bold">Usage Reports</h1>
           <div className="flex items-center gap-4">
@@ -174,15 +253,161 @@ const ReportPage: React.FC = () => {
           </div>
         </div>
 
-        <button
-          onClick={downloadReport}
-          disabled={loading}
-          className={`px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 ${
-            loading ? 'opacity-50 cursor-not-allowed' : ''
-          }`}
-        >
-          {loading ? 'Generating Report...' : 'Download Report'}
-        </button>
+        <div className="flex flex-wrap items-end gap-3 mb-4">
+          <div>
+            <label className="block text-xs text-gray-500 mb-1" htmlFor="report-from">
+              From
+            </label>
+            <input
+              id="report-from"
+              type="date"
+              value={from}
+              onChange={(e) => setFrom(e.target.value)}
+              className="border border-gray-300 rounded px-2 py-1.5 text-sm"
+            />
+          </div>
+          <div>
+            <label className="block text-xs text-gray-500 mb-1" htmlFor="report-to">
+              To
+            </label>
+            <input
+              id="report-to"
+              type="date"
+              value={to}
+              onChange={(e) => setTo(e.target.value)}
+              className="border border-gray-300 rounded px-2 py-1.5 text-sm"
+            />
+          </div>
+          <button
+            onClick={downloadReport}
+            disabled={loading}
+            className={`px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 ${
+              loading ? 'opacity-50 cursor-not-allowed' : ''
+            }`}
+          >
+            {loading ? 'Generating Report…' : 'Download Report'}
+          </button>
+          {!from && !to && (
+            <span className="text-xs text-gray-400">
+              empty period = the whole period processed by ETL
+            </span>
+          )}
+        </div>
+
+        {report && (
+          <div className="mt-6">
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="font-semibold text-lg">
+                  {report.customer.fullName} ({report.customer.email})
+                </h2>
+                <p className="text-xs text-gray-500">
+                  period {report.period.from} … {report.period.to} · ETL data available until{' '}
+                  {report.dataAvailableUntil}
+                </p>
+              </div>
+              <button
+                onClick={saveReportAsJson}
+                className="px-3 py-1 bg-gray-200 text-gray-700 rounded hover:bg-gray-300 text-sm"
+              >
+                Save .json
+              </button>
+            </div>
+
+            {report.prostheses.length === 0 && (
+              <p className="mt-4 text-sm text-gray-600">
+                No prostheses with telemetry data in the selected period.
+              </p>
+            )}
+
+            {report.prostheses.map((p) => (
+              <div key={p.prosthesisId} className="mt-6 border border-gray-200 rounded">
+                <div className="px-4 py-2 bg-gray-50 border-b border-gray-200">
+                  <span className="font-medium">{p.model}</span>{' '}
+                  <span className="text-gray-500 text-sm">serial {p.serial}</span>
+                </div>
+                <dl className="grid grid-cols-2 sm:grid-cols-4 gap-x-4 gap-y-2 p-4 text-sm">
+                  <div>
+                    <dt className="text-xs text-gray-500">Days</dt>
+                    <dd className="font-medium">{p.summary.days}</dd>
+                  </div>
+                  <div>
+                    <dt className="text-xs text-gray-500">Avg battery, %</dt>
+                    <dd className="font-medium">{p.summary.avgBatteryLevel.toFixed(1)}</dd>
+                  </div>
+                  <div>
+                    <dt className="text-xs text-gray-500">Avg signal quality</dt>
+                    <dd className="font-medium">{p.summary.avgSignalQuality.toFixed(1)}</dd>
+                  </div>
+                  <div>
+                    <dt className="text-xs text-gray-500">Movements</dt>
+                    <dd className="font-medium">{p.summary.totalMovements}</dd>
+                  </div>
+                  <div>
+                    <dt className="text-xs text-gray-500">Gestures recognized</dt>
+                    <dd className="font-medium">{p.summary.totalGestures}</dd>
+                  </div>
+                  <div>
+                    <dt className="text-xs text-gray-500">Recognition error rate, %</dt>
+                    <dd className="font-medium">
+                      {(p.summary.recognitionErrorRate * 100).toFixed(1)}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt className="text-xs text-gray-500">Max temperature, °C</dt>
+                    <dd className="font-medium">{p.summary.maxTemperatureC.toFixed(1)}</dd>
+                  </div>
+                  <div>
+                    <dt className="text-xs text-gray-500">Error codes</dt>
+                    <dd className="font-medium">
+                      {p.summary.errorCodes.length > 0 ? p.summary.errorCodes.join(', ') : '—'}
+                    </dd>
+                  </div>
+                </dl>
+                <div className="overflow-x-auto px-4 pb-4">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="text-left text-gray-500 border-b border-gray-200">
+                        <th className="py-1 pr-3">Day</th>
+                        <th className="py-1 pr-3">Battery avg/min, %</th>
+                        <th className="py-1 pr-3">Signal quality</th>
+                        <th className="py-1 pr-3">Movements</th>
+                        <th className="py-1 pr-3">Gestures</th>
+                        <th className="py-1 pr-3">Errors</th>
+                        <th className="py-1 pr-3">Temp max, °C</th>
+                        <th className="py-1">Error codes</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {p.daily.map((d) => (
+                        <tr key={d.day} className="border-b border-gray-100">
+                          <td className="py-1 pr-3">{d.day}</td>
+                          <td className="py-1 pr-3">
+                            {d.avgBatteryLevel.toFixed(1)} / {d.minBatteryLevel.toFixed(1)}
+                          </td>
+                          <td className="py-1 pr-3">{d.avgSignalQuality.toFixed(1)}</td>
+                          <td className="py-1 pr-3">{d.totalMovements}</td>
+                          <td className="py-1 pr-3">{d.totalGestures}</td>
+                          <td className="py-1 pr-3">{d.totalRecognitionErrors}</td>
+                          <td className="py-1 pr-3">{d.maxTemperatureC.toFixed(1)}</td>
+                          <td className="py-1">
+                            {d.errorCodes.length > 0 ? d.errorCodes.join(', ') : '—'}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {reportError && (
+          <div className="mt-4 p-4 bg-amber-100 text-amber-800 rounded text-sm">
+            {reportError}
+          </div>
+        )}
 
         {yandex?.consent === 'GRANTED' && yandex.profile && (
           <div className="mt-6 p-4 bg-indigo-50 border border-indigo-200 rounded">
@@ -227,7 +452,7 @@ const ReportPage: React.FC = () => {
             </p>
             <ul className="list-disc list-inside text-sm text-gray-600 mb-4">
               <li>Name: {yandex.profile.fullName || yandex.profile.login || 'unknown'}</li>
-              <li>Email: {yandex.profile.email || 'unknown'}</li>
+              <li>Email: {yandex.profile.email || yandex.profile.login || 'unknown'}</li>
             </ul>
             <div className="flex gap-3">
               <button

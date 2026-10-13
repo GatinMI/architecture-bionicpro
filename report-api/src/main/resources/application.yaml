@@ -1,0 +1,22 @@
+spring:
+  application:
+    name: report-api
+
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: ${KEYCLOAK_REALM_URI}
+          jwk-set-uri: ${KEYCLOAK_JWK_SET_URI}
+
+# Витрина отчётности в ClickHouse (OLAP), данные грузит Airflow
+clickhouse:
+  url: jdbc:clickhouse://${CLICKHOUSE_HOST:clickhouse}:${CLICKHOUSE_PORT:8123}/${CLICKHOUSE_DB:bionicpro}
+  user: ${CLICKHOUSE_USER:bionicpro}
+  password: ${CLICKHOUSE_PASSWORD:bionicpro}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info

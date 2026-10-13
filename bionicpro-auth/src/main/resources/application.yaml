@@ -45,6 +45,12 @@ spring:
                 - Path=/api/users/**
               filters:
                 - TokenRelay=
+            - id: reports
+              uri: ${REPORT_API_URI}
+              predicates:
+                - Path=/api/reports/**
+              filters:
+                - TokenRelay=
   data:
     redis:
       host: ${REDIS_HOST}

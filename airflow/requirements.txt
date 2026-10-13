@@ -1,0 +1,5 @@
+# Зависимости DAG bionicpro_report_etl:
+# psycopg2-binary   — чтение источников (CRM, телеметрия) по PostgreSQL-протоколу
+# clickhouse-connect— запись в OLAP (native-протокол)
+psycopg2-binary==2.9.13
+clickhouse-connect==1.10.0

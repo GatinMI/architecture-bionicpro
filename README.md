@@ -17,13 +17,16 @@ docker compose up --build
 | bionicpro-auth | 8081 | BFF: интеграция с Keycloak, сессии, TokenRelay на user-api и report-api |
 | keycloak | 8080 | realm `reports-realm`: пользователи, брокер Яндекса, LDAP, MFA |
 | user-api | 8083 | профиль Яндекса + согласие пользователя, Postgres (r2dbc) |
-| report-api | 8085 | отчёт по пользователю из витрины ClickHouse (`GET /api/reports`) |
+| report-api | 8085 | отчёт по пользователю: S3-first через CDN, витрина ClickHouse только при miss (`GET /api/reports`) |
 | yandex-shim | 8090 | адаптер Яндекс ID → OIDC для Identity Brokering Keycloak |
 | openldap | 389/636 | пользователи представительства в другой стране (`ldap/config.ldif`) |
 | user-db / keycloak_db | 5434 / 5433 | PostgreSQL для user-api и Keycloak |
 | crm-db | 5435 | эмуляция БД CRM (клиенты, протезы), источник ETL |
 | telemetry-db | 5436 | телеметрия с чипов («База данных» из исходной C4), источник ETL |
 | clickhouse | 8123/9000 | OLAP: снимки CRM, телеметрия, витрина отчёта, watermark ETL |
+| minio | 9002/9001 | S3-хранилище сформированных отчётов (S3 API 9002, Web-консоль 9001) |
+| minio-init | — | одноразовая инициализация MinIO: бакет, public-read, ILM-правило |
+| cdn | 8088 | эмуляция CDN: nginx reverse proxy на MinIO с дисковым кешем |
 | airflow-apiserver | 8084 | Airflow 3 (scheduler/worker/dag-processor/triggerer — отдельные сервисы) |
 | airflow-db | — | метаданные Airflow (PostgreSQL, наружу не торчит) |
 | redis | 6379 | сессии BFF (access + refresh-токены), брокер Celery (db 1) |
@@ -135,6 +138,34 @@ role-mapper (`bionicpro_role=user` → realm-роль `user`), так что Я�
   именно по e-mail сервис отчётов связывает JWT с клиентом CRM (в продакшене вместо
   e-mail был бы стабильный внешний идентификатор клиента).
 
+### Тестовые пользователи: для кого есть телеметрия
+
+Телеметрия (`db/telemetry/001_init.sql`) генерируется **только для пяти серий протезов**
+(`BPN-2025-0001`, `BPN-2025-0002`, `BPN-2025-0003`, `BPN-2026-0101`, `BPN-2026-0102`).
+Какой отчёт увидит пользователь при входе — сводная таблица для проверки:
+
+| Логин | Пароль | e-mail (в CRM) | Протезы в CRM | Телеметрия | Что покажет `GET /api/reports` |
+|---|---|---|---|---|---|
+| `prothetic1` | `prothetic123` | prothetic1@example.com | 2: `BPN-2025-0001`, `BPN-2026-0101` | ✅ | полный отчёт, **2 протеза** (кейс «несколько протезов») |
+| `prothetic2` | `prothetic123` | prothetic2@example.com | 1: `BPN-2025-0002` | ✅ | полный отчёт, 1 протез |
+| `prothetic3` | `prothetic123` | prothetic3@example.com | 1: `BPN-2025-0003` | ✅ | полный отчёт, 1 протез |
+| `john.doe` | `password` | john@example.com | 1: `BPN-2026-0102` | ✅ | полный отчёт, 1 протез |
+| `user1` | `password123` | user1@example.com | — | ❌ | 200, **пустой** список протезов |
+| `user2` | `password123` | user2@example.com | — | ❌ | 200, **пустой** список протезов |
+| `jane.smith` | `password` | jane@example.com | — | ❌ | 200, **пустой** список протезов |
+| `alex.johnson` | `password` | alex@example.com | — | ❌ | 200, **пустой** список протезов |
+| `admin1` | `admin123` | (отсутствует в CRM) | — | — | **404** `customer_not_found` |
+
+Примечания:
+
+- `john.doe`, `jane.smith`, `alex.johnson` — пользователи представительства, входят через
+  **LDAP-федерацию** (см. `ldap/config.ldif`), пароль у всех троих `password`. Остальные
+  — локальные пользователи Keycloak.
+- «Пустой список» (200) — это корректный ответ: клиент есть в CRM, но протезов/телеметрии
+  нет. Не путать с 404 у `admin1`, которого в CRM нет вовсе.
+- Изоляцию «только свои данные» удобно проверять парой `prothetic1` / `prothetic2`: у
+  prothetic1 два протеза, у prothetic2 один, и каждый видит только свои серии.
+
 ### Конвейер: Airflow → ClickHouse
 
 `airflow/dags/bionicpro_report_etl.py` — DAG `bionicpro_report_etl`, расписание ежедневно
@@ -164,5 +195,54 @@ ReportPage: кнопка «Download Report» + выбор периода (от/�
 период), отчёт рендерится на странице (сводка по протезу + подневная таблица), отдельная
 кнопка сохраняет отчёт как `.json`, ошибки 400/404/503 показываются человеческим
 сообщением («Данные доступны до …»).
+
+
+
+## Задание 3 — снижение нагрузки на базу (S3 + CDN)
+
+См. [task3-cdn.drawio](task3-cdn.drawio). Цель — убрать повторные запросы к OLAP-витрине:
+сформированный отчёт кладётся в объектное хранилище (S3 API) и раздаётся через CDN-эмуляцию
+на nginx.
+
+### Компоненты
+
+- **MinIO** — S3-совместимое хранилище, образ `cr.yandex/mirror/minio/minio:latest`.
+- **report-api** — переход на S3-first. `GET /api/reports` теперь отдаёт JSON-конверт
+  `{"report_url", "from", "to", "data_available_until", "cached"}`; сам JSON отчёта фронтенд
+  добирает по `report_url` уже с CDN.
+- **CDN (nginx)** — порт 8088, конфиги в папке `nginx/` (`nginx.conf` +
+  `conf.d/bionicpro-cdn.conf`). Reverse proxy на MinIO в path-style: URL
+  `http://localhost:8088/reports/…` проходит «как есть» в `http://minio:9000/reports/…`
+  (бакет = `reports`). Включён `proxy_cache` на диске (volume `cdn-cache`),
+  `X-Cache: HIT/MISS` для проверки. CORS — на стороне CDN: nginx отражает
+
+### Структура ключей в S3 (быстрый доступ)
+
+```
+reports/{email}/g{поколение ETL}/{от}_{до}.json
+```
+
+Ключ детерминирован (O(1) GET/HEAD, без листинга бакета); email-префикс даёт аудит и
+разделение по пользователю; «поколение» — версионность (см. ниже).
+
+### Механизм обновления кеша
+
+- **Версионирование по ETL-поколению.** «Поколение» = дата watermark, до которой Airflow
+  обработал данные. report-api всегда строит ключ от **текущего** поколения, поэтому при
+  hit по S3 нельзя отдать устаревший отчёт. Когда Airflow сдвигает watermark, ключ
+  меняется, отчёт пересобирается под новым URL — старый кеш становится просто неиспользуемым.
+- **Очистка.** Старые поколения в бакете удаляет ILM-правило MinIO (30 дней); в кеше nginx —
+  TTL 24h + `proxy_cache_use_stale` как страховка. В реальном CDN инвалидация делалась бы
+  через API (CloudFront invalidation / PURGE-запрос); в эмуляции версионируемые URL
+  дают тот же эффект без доп. инфраструктуры.
+
+
+### Фронтенд
+
+ReportPage получает конверт, затем `fetch(report_url)` с CDN и рендерит JSON. Под заголовком
+отчёта показывается, из чего он был доставлен: «из кеша S3/CDN» (hit) или «сгенерирован и
+сохранён в S3» (miss) + статус `X-Cache` и ссылка на CDN.
+
+
 
 

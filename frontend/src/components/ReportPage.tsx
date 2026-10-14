@@ -61,6 +61,15 @@ interface ReportData {
   prostheses: ProsthesisReport[];
 }
 
+
+interface ReportEnvelope {
+  report_url: string;
+  from?: string;
+  to?: string;
+  data_available_until: string;
+  cached: boolean;
+}
+
 const ReportPage: React.FC = () => {
   const [user, setUser] = useState<UserInfo | null>(null);
   const [loading, setLoading] = useState(false);
@@ -72,6 +81,8 @@ const ReportPage: React.FC = () => {
   const [to, setTo] = useState('');
   const [report, setReport] = useState<ReportData | null>(null);
   const [reportError, setReportError] = useState<string | null>(null);
+  const [envelope, setEnvelope] = useState<ReportEnvelope | null>(null);
+  const [cdnStatus, setCdnStatus] = useState<string | null>(null);
 
   useEffect(() => {
     const run = async () => {
@@ -158,6 +169,8 @@ const ReportPage: React.FC = () => {
       setError(null);
       setReport(null);
       setReportError(null);
+      setEnvelope(null);
+      setCdnStatus(null);
 
       const params = new URLSearchParams();
       if (from) params.set('from', from);
@@ -191,7 +204,15 @@ const ReportPage: React.FC = () => {
         throw new Error(`Request failed: ${response.status}`);
       }
 
-      const data: ReportData = await response.json();
+      const env: ReportEnvelope = await response.json();
+      setEnvelope(env);
+
+      const cdnResponse = await fetch(env.report_url);
+      if (!cdnResponse.ok) {
+        throw new Error(`CDN request failed: ${cdnResponse.status}`);
+      }
+      setCdnStatus(cdnResponse.headers.get('x-cache'));
+      const data: ReportData = await cdnResponse.json();
       setReport(data);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred');
@@ -305,6 +326,24 @@ const ReportPage: React.FC = () => {
                   period {report.period.from} … {report.period.to} · ETL data available until{' '}
                   {report.dataAvailableUntil}
                 </p>
+                {envelope && (
+                  <p className="text-xs text-gray-500 mt-1">
+                    {envelope.cached
+                      ? 'Report loaded from S3 — served by CDN cache, no OLAP query'
+                      : 'Report generated from OLAP and stored in S3'}
+                    {cdnStatus ? ` · CDN cache: ${cdnStatus}` : ''}
+                    {' · '}
+                    <a
+                      href={envelope.report_url}
+                      target="_blank"
+                      rel="noreferrer"
+                      title={envelope.report_url}
+                      className="text-blue-500 hover:underline"
+                    >
+                      CDN link
+                    </a>
+                  </p>
+                )}
               </div>
               <button
                 onClick={saveReportAsJson}

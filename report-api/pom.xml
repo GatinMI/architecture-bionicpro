@@ -20,6 +20,7 @@
     <properties>
         <java.version>25</java.version>
         <clickhouse.version>0.9.9</clickhouse.version>
+        <awssdk.version>2.55.16</awssdk.version>
     </properties>
 
     <dependencies>
@@ -42,6 +43,14 @@
             <groupId>com.clickhouse</groupId>
             <artifactId>clickhouse-jdbc</artifactId>
             <version>${clickhouse.version}</version>
+        </dependency>
+
+        <!-- S3 API (MinIO): складывание сформированных отчётов в бакет reports.
+             Асинхронный клиент — встраивается в WebFlux без блокирующих потоков -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>s3</artifactId>
+            <version>${awssdk.version}</version>
         </dependency>
     </dependencies>
 

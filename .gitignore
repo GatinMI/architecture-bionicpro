@@ -1,6 +1,7 @@
 # Локальные артефакты Airflow (логи и сгенерированный конфиг)
 /airflow/logs/
 /airflow/config/
+__pycache__/
 
 /postgres-keycloak-data
 2024__yandex-architecture-sso.code-workspace

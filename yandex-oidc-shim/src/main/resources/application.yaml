@@ -1,0 +1,25 @@
+server:
+  port: 8090
+
+spring:
+  application:
+    name: yandex-oidc-shim
+
+yandex:
+  shim:
+    client-id: bionicpro
+    client-secret: bionicpro-yandex-shim-secret
+    issuer: http://localhost:8090
+    yandex-client-id: ${YANDEX_CLIENT_ID:PLACEHOLDER_YANDEX_CLIENT_ID}
+    yandex-client-secret: ${YANDEX_CLIENT_SECRET:PLACEHOLDER_YANDEX_CLIENT_SECRET}
+    yandex-scopes: login:info login:email
+    yandex-authorize-url: https://oauth.yandex.ru/authorize
+    yandex-token-url: https://oauth.yandex.ru/token
+    yandex-info-url: https://login.yandex.ru/info
+    id-token-ttl-seconds: 300
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info

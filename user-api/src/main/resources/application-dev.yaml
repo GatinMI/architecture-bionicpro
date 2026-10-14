@@ -1,0 +1,17 @@
+server:
+  port: 8083
+
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: http://localhost:8080/realms/reports-realm
+          jwk-set-uri: http://keycloak:8080/realms/reports-realm/protocol/openid-connect/certs
+
+  r2dbc:
+    url: r2dbc:postgresql://localhost:5434/bionicpro
+    username: bionicpro
+    password: bionicpro
+
+

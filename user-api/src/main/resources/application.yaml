@@ -1,0 +1,26 @@
+spring:
+  application:
+    name: user-api
+
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: ${KEYCLOAK_REALM_URI}
+          jwk-set-uri: ${KEYCLOAK_JWK_SET_URI}
+
+  r2dbc:
+    url: r2dbc:postgresql://${USER_DB_HOST:user-db}:${USER_DB_PORT:5432}/${USER_DB_NAME:bionicpro}
+    username: ${USER_DB_USER:bionicpro}
+    password: ${USER_DB_PASSWORD:bionicpro}
+
+  flyway:
+    url: jdbc:postgresql://${USER_DB_HOST:user-db}:${USER_DB_PORT:5432}/${USER_DB_NAME:bionicpro}
+    user: ${USER_DB_USER:bionicpro}
+    password: ${USER_DB_PASSWORD:bionicpro}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info

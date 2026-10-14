@@ -1,0 +1,6 @@
+# Локальные артефакты Airflow (логи, конфиг, плагины) не нужны в образе
+dags
+logs
+config
+plugins
+__pycache__

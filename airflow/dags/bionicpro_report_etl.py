@@ -1,11 +1,16 @@
 """ETL витрины отчётности BionicPRO.
 
 Конвейер:
-  1. load_crm         — полный снимок CRM (клиенты, протезы) в ClickHouse
-  2. load_telemetry   — инкрементальная выгрузка телеметрии в ClickHouse
-  3. build_view       — пересборка витрины report_prosthesis_daily
-                        (агрегаты телеметрии в разрезе клиента и дня)
-  4. update_watermark — метка «данные обработаны до даты N»
+  1. load_telemetry      — инкрементальная выгрузка телеметрии в ClickHouse
+  2. build_telemetry_view — агрегаты телеметрии в разрезе (протез, день)
+  3. update_watermark    — метка «данные обработаны до даты N»
+  4. refresh_wide_view   — триггер полной пересборки витрины
+                           report_prosthesis_daily_v2 (MaterializedView в CH,
+                           см. clickhouse/init/002_cdc.sql)
+
+Данные CRM (клиенты, протезы) в ClickHouse попадают не отсюда, а через
+Debezium CDC в реальном времени: CRM PG -> Kafka -> KafkaEngine -> зеркала.
+Массовая выгрузка CRM (задача load_crm) убрана — она нагружала OLTP-базу.
 
 Расписание: ежедневно в 02:00. catchup=False — бэкилл за прошедшие периоды
 при первом запуске не выполняется; период, который ещё не обработан ETL,
@@ -20,11 +25,6 @@ import psycopg2
 from clickhouse_connect import get_client
 from airflow.sdk import dag, task
 
-CRM_DSN = "dbname={n} user={u} password={p} host={h} port={pt}".format(
-    n=os.environ["CRM_DB_NAME"], u=os.environ["CRM_DB_USER"],
-    p=os.environ["CRM_DB_PASSWORD"], h=os.environ["CRM_DB_HOST"],
-    pt=os.environ["CRM_DB_PORT"],
-)
 TELEMETRY_DSN = "dbname={n} user={u} password={p} host={h} port={pt}".format(
     n=os.environ["TELEMETRY_DB_NAME"], u=os.environ["TELEMETRY_DB_USER"],
     p=os.environ["TELEMETRY_DB_PASSWORD"], h=os.environ["TELEMETRY_DB_HOST"],
@@ -54,34 +54,6 @@ def _utc(dt):
     if dt.tzinfo is not None:
         dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
     return dt
-
-
-@task(**RETRIES, task_id="load_crm")
-def load_crm() -> int:
-    """Полный снимок CRM-таблиц в ClickHouse (таблицы небольшие)."""
-    with _pg(CRM_DSN) as conn, conn.cursor() as cur:
-        cur.execute(
-            "SELECT id, full_name, email, COALESCE(phone, ''), created_at "
-            "FROM customers ORDER BY id"
-        )
-        customers = cur.fetchall()
-        cur.execute(
-            "SELECT id, customer_id, model, serial_number, produced_at, "
-            "COALESCE(delivery_date, produced_at) "
-            "FROM prostheses ORDER BY id"
-        )
-        prostheses = cur.fetchall()
-
-    ch = _ch()
-    ch.command("TRUNCATE TABLE bionicpro.crm_customers")
-    ch.command("TRUNCATE TABLE bionicpro.prostheses")
-    ch.insert("bionicpro.crm_customers", customers,
-              column_names=["id", "full_name", "email", "phone", "created_at"])
-    ch.insert("bionicpro.prostheses", prostheses,
-              column_names=["id", "customer_id", "model", "serial_number",
-                            "produced_at", "delivery_date"])
-    print(f"crm: {len(customers)} customers, {len(prostheses)} prostheses")
-    return len(customers)
 
 
 @task(**RETRIES, task_id="load_telemetry")
@@ -124,21 +96,18 @@ def load_telemetry() -> int:
     return len(rows)
 
 
-@task(**RETRIES, task_id="build_view")
-def build_view() -> int:
-    """Пересборка витрины: агрегаты телеметрии по клиенту/протезу/дню."""
+@task(**RETRIES, task_id="build_telemetry_view")
+def build_telemetry_view() -> int:
+    """Чистые агрегаты телеметрии по (протез, день) без join'а с CRM.
+    CRM-атрибуты добавляются в витрину report_prosthesis_daily_v2 на стороне
+    ClickHouse (MaterializedView поверх зеркал CDC, см. 002_cdc.sql)."""
     ch = _ch()
-    ch.command("TRUNCATE TABLE bionicpro.report_prosthesis_daily")
+    ch.command("TRUNCATE TABLE bionicpro.telemetry_prosthesis_daily")
     ch.query(
         """
-        INSERT INTO bionicpro.report_prosthesis_daily
+        INSERT INTO bionicpro.telemetry_prosthesis_daily
         SELECT
-            p.customer_id,
-            c.email,
-            c.full_name,
-            p.id,
-            p.serial_number,
-            p.model,
+            t.prosthesis_serial,
             toDate(t.recorded_at)                                    AS day,
             avg(t.battery_level)                                     AS avg_battery_level,
             min(t.battery_level)                                     AS min_battery_level,
@@ -152,16 +121,13 @@ def build_view() -> int:
             )))                                                      AS error_codes,
             count()                                                  AS measurements
         FROM bionicpro.telemetry AS t FINAL
-        JOIN bionicpro.prostheses AS p ON p.serial_number = t.prosthesis_serial
-        JOIN bionicpro.crm_customers AS c ON c.id = p.customer_id
-        GROUP BY p.customer_id, c.email, c.full_name,
-                 p.id, p.serial_number, p.model, day
+        GROUP BY t.prosthesis_serial, day
         """
     )
     total = ch.query(
-        "SELECT count() FROM bionicpro.report_prosthesis_daily"
+        "SELECT count() FROM bionicpro.telemetry_prosthesis_daily"
     ).result_rows[0][0]
-    print(f"view: {total} rows rebuilt")
+    print(f"telemetry view: {total} rows rebuilt")
     return total
 
 
@@ -182,22 +148,47 @@ def update_watermark() -> str:
     return str(up_to)
 
 
+@task(**RETRIES, task_id="refresh_wide_view")
+def refresh_wide_view() -> int:
+    """Полная пересборка витрины report_prosthesis_daily_v2.
+
+    Вставляем строку-триггер: MaterializedView report_v2_mv_refresh на её
+    основе пересобирает все строки витрины (CRM-зеркала CDC × агрегаты
+    телеметрии) с version = ts. Затем удаляем более старые версии — это
+    чистит строки по протезам, удалённым из CRM между запусками ETL.
+    """
+    ch = _ch()
+    run_id = ch.query(
+        "SELECT coalesce(max(run_id), 0) + 1 FROM bionicpro.wide_refresh_trigger"
+    ).result_rows[0][0]
+    ts = int(datetime.now(timezone.utc).timestamp() * 1000)
+    ch.insert("bionicpro.wide_refresh_trigger",
+              [(run_id, ts, datetime.now(timezone.utc))],
+              column_names=["run_id", "ts_ms", "updated_at"])
+    ch.command(
+        "ALTER TABLE bionicpro.report_prosthesis_daily_v2 "
+        f"DELETE WHERE version < {ts} SETTINGS mutations_sync = 1"
+    )
+    total = ch.query(
+        "SELECT count() FROM bionicpro.report_prosthesis_daily_v2 FINAL"
+    ).result_rows[0][0]
+    print(f"wide view: refresh run {run_id} (ts {ts}), {total} rows")
+    return total
+
+
 @dag(dag_id="bionicpro_report_etl",
      schedule="0 2 * * *",
      start_date=datetime(2026, 9, 1),
      catchup=False,
      tags=["reports", "etl"],
-     doc_md="E2E: CRM + телеметрия -> ClickHouse, витрина по клиентам, водяной знак")
+     doc_md="ETL: телеметрия -> ClickHouse + refresh витрины; "
+            "CRM в CH приходит через Debezium CDC (Задание 4)")
 def bionicpro_report_etl() -> None:
-    crm = load_crm()
     telemetry = load_telemetry()
-    view = build_view()
+    view = build_telemetry_view()
     watermark = update_watermark()
-    # view ждёт и CRM-снимок, и телеметрию (в Airflow 3 оператор & для
-    # XCom-аргументов не поддерживается — зависимости ставим по одному)
-    crm >> view
-    telemetry >> view
-    view >> watermark
+    refresh = refresh_wide_view()
+    telemetry >> view >> watermark >> refresh
 
 
 bionicpro_report_etl()

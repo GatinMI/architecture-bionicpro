@@ -57,7 +57,7 @@ public class ClickHouseReportRepository {
 
     /** Самая ранняя дата в витрине (данные раньше — не собирались). */
     public Optional<LocalDate> minViewDay() {
-        String sql = "SELECT min(day) FROM report_prosthesis_daily";
+        String sql = "SELECT min(day) FROM report_prosthesis_daily_v2 FINAL WHERE deleted = 0";
         try (Connection c = connect(); PreparedStatement ps = c.prepareStatement(sql);
              ResultSet rs = ps.executeQuery()) {
             return rs.next() && !rs.wasNull()
@@ -68,8 +68,10 @@ public class ClickHouseReportRepository {
         }
     }
 
+    /** Клиент из CDC-зеркала CRM (Debezium -> Kafka -> ClickHouse). */
     public Optional<Customer> findCustomerByEmail(String email) {
-        String sql = "SELECT id, full_name, email FROM crm_customers WHERE email = ? LIMIT 1";
+        String sql = "SELECT id, full_name, email FROM crm_customers_cdc FINAL "
+            + "WHERE email = ? AND deleted = 0 LIMIT 1";
         try (Connection c = connect(); PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setString(1, email);
             try (ResultSet rs = ps.executeQuery()) {
@@ -83,19 +85,20 @@ public class ClickHouseReportRepository {
         }
     }
 
-    /** Подневные агрегаты по всем протезам пользователя за период. */
-    public List<ProsthesisDayRow> findDailyByProsthesis(String email, LocalDate from, LocalDate to) {
+    /** Подневные агрегаты по всем протезам пользователя за период.
+     *  customer_id — префикс ORDER BY витрины: запрос идёт prefix-сканом. */
+    public List<ProsthesisDayRow> findDailyByProsthesis(long customerId, LocalDate from, LocalDate to) {
         String sql = """
             SELECT prosthesis_id, prosthesis_serial, prosthesis_model, day,
                    avg_battery_level, min_battery_level, avg_signal_quality,
                    total_movements, total_gestures, total_recognition_errors,
                    max_temperature_c, error_codes, measurements
-            FROM report_prosthesis_daily
-            WHERE customer_email = ? AND day >= ? AND day <= ?
+            FROM report_prosthesis_daily_v2 FINAL
+            WHERE customer_id = ? AND deleted = 0 AND day >= ? AND day <= ?
             ORDER BY prosthesis_id, day
             """;
         try (Connection c = connect(); PreparedStatement ps = c.prepareStatement(sql)) {
-            ps.setString(1, email);
+            ps.setLong(1, customerId);
             ps.setDate(2, Date.valueOf(from));
             ps.setDate(3, Date.valueOf(to));
             List<ProsthesisDayRow> rows = new ArrayList<>();

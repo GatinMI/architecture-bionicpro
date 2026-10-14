@@ -109,7 +109,7 @@ public class ReportService {
         Customer customer = repo.findCustomerByEmail(prepared.email())
             .orElseThrow(() -> new CustomerNotFoundException(prepared.email()));
 
-        List<ProsthesisDayRow> rows = repo.findDailyByProsthesis(prepared.email(), from, to);
+        List<ProsthesisDayRow> rows = repo.findDailyByProsthesis(customer.id(), from, to);
         return new ReportResponse(
             customer,
             new ReportResponse.RequestedPeriod(prepared.requestedFrom(), prepared.requestedTo()),

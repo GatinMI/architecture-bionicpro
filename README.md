@@ -2,7 +2,7 @@
 
 ## Запуск
 
-Весь стек — в `docker-compose.yaml`:
+Весь стек - в `docker-compose.yaml`:
 
 ```bash
 cp .env.example .env   # вписать YANDEX_CLIENT_ID / YANDEX_CLIENT_SECRET (см. ниже)
@@ -21,14 +21,17 @@ docker compose up --build
 | yandex-shim | 8090 | адаптер Яндекс ID → OIDC для Identity Brokering Keycloak |
 | openldap | 389/636 | пользователи представительства в другой стране (`ldap/config.ldif`) |
 | user-db / keycloak_db | 5434 / 5433 | PostgreSQL для user-api и Keycloak |
-| crm-db | 5435 | эмуляция БД CRM (клиенты, протезы), источник ETL |
+| crm-db | 5435 | эмуляция БД CRM (клиенты, протезы); источник CDC - Debezium читает её WAL |
 | telemetry-db | 5436 | телеметрия с чипов («База данных» из исходной C4), источник ETL |
-| clickhouse | 8123/9000 | OLAP: снимки CRM, телеметрия, витрина отчёта, watermark ETL |
+| clickhouse | 8123/9000 | OLAP: зеркала CRM (CDC), телеметрия, витрина отчёта, watermark ETL |
 | minio | 9002/9001 | S3-хранилище сформированных отчётов (S3 API 9002, Web-консоль 9001) |
-| minio-init | — | одноразовая инициализация MinIO: бакет, public-read, ILM-правило |
+| minio-init | - | одноразовая инициализация MinIO: бакет, public-read, ILM-правило |
 | cdn | 8088 | эмуляция CDN: nginx reverse proxy на MinIO с дисковым кешем |
-| airflow-apiserver | 8084 | Airflow 3 (scheduler/worker/dag-processor/triggerer — отдельные сервисы) |
-| airflow-db | — | метаданные Airflow (PostgreSQL, наружу не торчит) |
+| kafka | 9092 | Apache Kafka (KRaft, один нод): топики `bionicpro.crm.public.*` - CDC-события CRM |
+| kafka-connect | 18083 | Debezium (Kafka Connect, standalone): PostgresConnector для crm-db |
+| debezium-init | - | одноразовая регистрация коннектора Debezium (POST в Connect REST) |
+| airflow-apiserver | 8084 | Airflow 3 (scheduler/worker/dag-processor/triggerer - отдельные сервисы) |
+| airflow-db | - | метаданные Airflow (PostgreSQL, наружу не торчит) |
 | redis | 6379 | сессии BFF (access + refresh-токены), брокер Celery (db 1) |
 
 Админка Keycloak: `admin / admin`. Для логина через настоящий Яндекс ID нужно
@@ -37,25 +40,25 @@ docker compose up --build
 фамилия, пол» + «Адрес электронной почты») и положить `client_id`/`client_secret` в `.env`.
 
 
-## Задание 1 — архитектура управления учётными данными
+## Задание 1 - архитектура управления учётными данными
 
 См. [task1-c4.drawio](task1-c4.drawio). Три принципа, на которые завязана вся
 схема:
 
-1. **Единая точка аутентификации — realm Keycloak.** Все три типа пользователей
+1. **Единая точка аутентификации - realm Keycloak.** Все три типа пользователей
    auth'ятся через один realm `reports-realm`: локальные пользователи живут прямо в
-   Keycloak, сотрудники представительств в другой стране — через LDAP-федерацию
+   Keycloak, сотрудники представительств в другой стране - через LDAP-федерацию
    (данные учётных записей запрашиваются из внешнего источника в стране представительства,
-   локальное копирование ПДН не требуется — Keycloak ходит в LDAP по мере надобности),
-   а пользователи российского IdP — через Identity Brokering. Архитектура не привязана к
+   локальное копирование ПДН не требуется - Keycloak ходит в LDAP по мере надобности),
+   а пользователи российского IdP - через Identity Brokering. Архитектура не привязана к
    Яндексу: IdP другой страны добавляется как ещё один OIDC-брокер со своими
    identity-provider mappers, без изменения остальных сервисов.
 2. **Токены IdP не попадают во фронтенд.** Браузер общается только с BFF
    (`bionicpro-auth`) и держит одну сессионную cookie. Access/refresh-токены Keycloak
    живут на серверной стороне (в сессии в Redis), а во внутренние сервисы BFF
-   прокидывает их через `TokenRelay` уже сам — фронтенд к Keycloak не ходит вообще.
-3. **Stateless сервисы.** BFF и user-api не хранят собственного состояния — сессии и
-   токены лежат в Redis, данные — в Postgres. Поэтому решение горизонтально масштабируемо:
+   прокидывает их через `TokenRelay` уже сам - фронтенд к Keycloak не ходит вообще.
+3. **Stateless сервисы.** BFF и user-api не хранят собственного состояния - сессии и
+   токены лежат в Redis, данные - в Postgres. Поэтому решение горизонтально масштабируемо:
    ещё одну реплику `bionicpro-auth` или `user-api` можно поставить за балансировщик, и
    она сразу примет трафик. Stateful-состав (Keycloak, базы, Redis) в продакшене также
    разворачивается по стандартным схемам HA.
@@ -78,12 +81,12 @@ docker compose up --build
 нет `sub`), поэтому Keycloak-брокер настраивается не на Яндекса напрямую, а на локальный
 адаптер **`yandex-oidc-shim`**, который для Keycloak эмулирует OIDC IdP:
 
-- `GET /authorize` — 302-редирект браузера на `oauth.yandex.ru/authorize`
+- `GET /authorize` - 302-редирект браузера на `oauth.yandex.ru/authorize`
   (scope `login:info login:email`);
-- `POST /token` — серверный обмен code на токен Яндекса, дальше запрос профиля
+- `POST /token` - серверный обмен code на токен Яндекса, дальше запрос профиля
   `GET /info?format=json` и выдача Keycloak собственного `id_token` (RS256,
   `iss=http://localhost:8090`, `aud=bionicpro`, `sub` = id Яндекса, плюс кастомные
-  claims `yandex_account_id` и `bionicpro_role`), `/jwks` — публичный ключ;
+  claims `yandex_account_id` и `bionicpro_role`), `/jwks` - публичный ключ;
 - на стороне брокера `disableNonce=true`, т.к. Яндекс nonce не поддерживает: защита от
   replay остаётся за однократным code и проверкой state.
 
@@ -100,7 +103,7 @@ role-mapper (`bionicpro_role=user` → realm-роль `user`), так что Я�
   `bionicpro-auth`) и хранит его в таблице `yandex_user_profiles`;
 - `GET /api/users/me/yandex` отдаёт текущее состояние (404 `not_a_yandex_user` для
   не-Яндекс-пользователей), `POST /api/users/me/yandex-consent` с `{"consent": true|false}`
-  фиксирует решение (GRANTED/DENIED) — один раз, повторно сервис разрешением не
+  фиксирует решение (GRANTED/DENIED) - один раз, повторно сервис разрешением не
   спрашивает;
 - фронтенд (ReportPage) показывает диалог согласия сразу после логина, пока решение не
   зафиксировано в БД.
@@ -108,32 +111,32 @@ role-mapper (`bionicpro_role=user` → realm-роль `user`), так что Я�
 Что я бы изменил для продакшена
 
 - **Готовые решения вместо spring gateway.**  oauth2-proxy, authelia и тд.
-- **У Яндекса есть Keycloak-расширение.** Альтернатива shim'у — готовый провайдер из
+- **У Яндекса есть Keycloak-расширение.** Альтернатива shim'у - готовый провайдер из
   [keycloak-russian-providers](https://github.com/playa-ru/keycloak-russian-providers):
   Яндекса в Keycloak добавляется как одно расширение, без отдельного микросервиса.
 - **Keycloak нужен публичный адрес.** В репо Keycloak живёт на `localhost:8080`, из-за
   чего приходится изворачиваться с переопределением настроек OAuth2-клиентов: у BFF
-  authorization-uri для браузера — `http://localhost:8080/...`, а token/jwks/userinfo-uri
-  для серверных вызовов — уже внутренний `http://keycloak:8080/...`; в realm-export
-  прописан `sslRequired: none`, у shim'а — два набора URL (браузерные `localhost:8090` и
+  authorization-uri для браузера - `http://localhost:8080/...`, а token/jwks/userinfo-uri
+  для серверных вызовов - уже внутренний `http://keycloak:8080/...`; в realm-export
+  прописан `sslRequired: none`, у shim'а - два набора URL (браузерные `localhost:8090` и
   серверные `yandex-shim:8090`). С публичным HTTPS-адресом Keycloak issuer, redirect URIs
   и `sslRequired` становятся единственными, и все эти переопределения можно убрать.
 
 
-## Задание 2 — сервис отчётов
+## Задание 2 - сервис отчётов
 
 См. [task2-reports.drawio](task2-reports.drawio). Три части: конвейер данных
 (Airflow → ClickHouse), бэкенд отчётов (`report-api`) и кнопка на фронтенде.
 
 ### Источники данных
 
-В исходной C4 телеметрия с чипов лежит в «Базе данных (PostgreSQL)», а данные о клиентах —
+В исходной C4 телеметрия с чипов лежит в «Базе данных (PostgreSQL)», а данные о клиентах -
 в CRM (Битрикс24). Оба источника эмулирую PostgreSQL-сервисами:
 
-- `telemetry-db` — таблица `prosthetic_telemetry`: почасовые срезы по каждому протезу
+- `telemetry-db` - таблица `prosthetic_telemetry`: почасовые срезы по каждому протезу
   (батарея, качество миосигнала, движения, распознанные жесты, коды ошибок, температура
   чипа). `db/telemetry/001_init.sql` генерит детерминированные ~75 дней данных;
-- `crm-db` — `customers` + `prostheses` (у одного клиента может быть несколько протезов),
+- `crm-db` - `customers` + `prostheses` (у одного клиента может быть несколько протезов),
   `db/crm/001_init.sql`. E-mail клиентов совпадают с e-mail пользователей Keycloak:
   именно по e-mail сервис отчётов связывает JWT с клиентом CRM (в продакшене вместо
   e-mail был бы стабильный внешний идентификатор клиента).
@@ -142,43 +145,40 @@ role-mapper (`bionicpro_role=user` → realm-роль `user`), так что Я�
 
 Телеметрия (`db/telemetry/001_init.sql`) генерируется **только для пяти серий протезов**
 (`BPN-2025-0001`, `BPN-2025-0002`, `BPN-2025-0003`, `BPN-2026-0101`, `BPN-2026-0102`).
-Какой отчёт увидит пользователь при входе — сводная таблица для проверки:
+Какой отчёт увидит пользователь при входе - сводная таблица для проверки:
 
 | Логин | Пароль | e-mail (в CRM) | Протезы в CRM | Телеметрия | Что покажет `GET /api/reports` |
 |---|---|---|---|---|---|
-| `prothetic1` | `prothetic123` | prothetic1@example.com | 2: `BPN-2025-0001`, `BPN-2026-0101` | ✅ | полный отчёт, **2 протеза** (кейс «несколько протезов») |
-| `prothetic2` | `prothetic123` | prothetic2@example.com | 1: `BPN-2025-0002` | ✅ | полный отчёт, 1 протез |
-| `prothetic3` | `prothetic123` | prothetic3@example.com | 1: `BPN-2025-0003` | ✅ | полный отчёт, 1 протез |
-| `john.doe` | `password` | john@example.com | 1: `BPN-2026-0102` | ✅ | полный отчёт, 1 протез |
-| `user1` | `password123` | user1@example.com | — | ❌ | 200, **пустой** список протезов |
-| `user2` | `password123` | user2@example.com | — | ❌ | 200, **пустой** список протезов |
-| `jane.smith` | `password` | jane@example.com | — | ❌ | 200, **пустой** список протезов |
-| `alex.johnson` | `password` | alex@example.com | — | ❌ | 200, **пустой** список протезов |
-| `admin1` | `admin123` | (отсутствует в CRM) | — | — | **404** `customer_not_found` |
+| `prothetic1` | `prothetic123` | prothetic1@example.com | 2: `BPN-2025-0001`, `BPN-2026-0101` | + | полный отчёт, **2 протеза** (кейс «несколько протезов») |
+| `prothetic2` | `prothetic123` | prothetic2@example.com | 1: `BPN-2025-0002` | + | полный отчёт, 1 протез |
+| `prothetic3` | `prothetic123` | prothetic3@example.com | 1: `BPN-2025-0003` | + | полный отчёт, 1 протез |
+| `john.doe` | `password` | john@example.com | 1: `BPN-2026-0102` | + | полный отчёт, 1 протез |
+| `user1` | `password123` | user1@example.com | - | - | 200, **пустой** список протезов |
+| `user2` | `password123` | user2@example.com | - | - | 200, **пустой** список протезов |
+| `jane.smith` | `password` | jane@example.com | - | - | 200, **пустой** список протезов |
+| `alex.johnson` | `password` | alex@example.com | - | - | 200, **пустой** список протезов |
+| `admin1` | `admin123` | (отсутствует в CRM) | - | - | **404** `customer_not_found` |
 
-Примечания:
-
-- `john.doe`, `jane.smith`, `alex.johnson` — пользователи представительства, входят через
-  **LDAP-федерацию** (см. `ldap/config.ldif`), пароль у всех троих `password`. Остальные
-  — локальные пользователи Keycloak.
-- «Пустой список» (200) — это корректный ответ: клиент есть в CRM, но протезов/телеметрии
-  нет. Не путать с 404 у `admin1`, которого в CRM нет вовсе.
-- Изоляцию «только свои данные» удобно проверять парой `prothetic1` / `prothetic2`: у
-  prothetic1 два протеза, у prothetic2 один, и каждый видит только свои серии.
 
 ### Конвейер: Airflow → ClickHouse
 
-`airflow/dags/bionicpro_report_etl.py` — DAG `bionicpro_report_etl`, расписание ежедневно
+`airflow/dags/bionicpro_report_etl.py` - DAG `bionicpro_report_etl`, расписание ежедневно
 в 02:00, `catchup=False` (бэкилл за прошедшие периоды при первом запуске не выполняется):
 
-1. `load_crm` — полный снимок CRM-таблиц (TRUNCATE + INSERT, таблицы маленькие);
-2. `load_telemetry` — инкремент: только срезы после `max(recorded_at)`, уже имеющегося в
+1. ~~`load_crm` - полный снимок CRM-таблиц~~ - с Задания 4 этого шага в DAG больше нет:
+   CRM-данные идут в ClickHouse по CDC (Debezium → Kafka), см. ниже;
+2. `load_telemetry` - инкремент: только срезы после `max(recorded_at)`, уже имеющегося в
    ClickHouse; таблица `ReplacingMergeTree`, поэтому повторная загрузка тех же срезов
    (повторный запуск) схлопывается;
-3. `build_view` — пересборка витрины `report_prosthesis_daily`: агрегаты телеметрии в
-   разрезе клиент/протез/день. `ORDER BY (customer_email, prosthesis_id, day)` — срез по
-   пользователю это prefix-скан, `PARTITION BY` месяц;
-4. `update_watermark` — запись в `etl_watermark`: «данные обработаны до даты N».
+3. `build_telemetry_view` - пересборка `telemetry_prosthesis_daily`: чистые агрегаты
+   телеметрии в разрезе протез/день (join с CRM здесь нет - CRM-атрибуты добавляет
+   MaterializedView по зеркалам CDC на стороне ClickHouse, см. Задание 4).
+   `ORDER BY (prosthesis_serial, day)`, `PARTITION BY` месяц;
+4. `update_watermark` - запись в `etl_watermark`: «данные обработаны до даты N»;
+5. `refresh_wide_view` (Задание 4) - полная пересборка витрины
+   `report_prosthesis_daily_v2`: INSERT в `wide_refresh_trigger` включает
+   MV `report_v2_mv_refresh` (CRM-зеркала × телеметрия), затем удаляются строки
+   с `version < ts` триггера.
 
 
 
@@ -186,7 +186,7 @@ role-mapper (`bionicpro_role=user` → realm-роль `user`), так что Я�
 
 `report-api` Spring WebFlux 
 
-`GET /api/reports?from=YYYY-MM-DD&to=YYYY-MM-DD` (период необязателен — по умолчанию весь
+`GET /api/reports?from=YYYY-MM-DD&to=YYYY-MM-DD` (период необязателен - по умолчанию весь
 обработанный период):
 
 ### Фронтенд
@@ -198,23 +198,23 @@ ReportPage: кнопка «Download Report» + выбор периода (от/�
 
 
 
-## Задание 3 — снижение нагрузки на базу (S3 + CDN)
+## Задание 3 - снижение нагрузки на базу (S3 + CDN)
 
-См. [task3-cdn.drawio](task3-cdn.drawio). Цель — убрать повторные запросы к OLAP-витрине:
+См. [task3-cdn.drawio](task3-cdn.drawio). Цель - убрать повторные запросы к OLAP-витрине:
 сформированный отчёт кладётся в объектное хранилище (S3 API) и раздаётся через CDN-эмуляцию
 на nginx.
 
 ### Компоненты
 
-- **MinIO** — S3-совместимое хранилище, образ `cr.yandex/mirror/minio/minio:latest`.
-- **report-api** — переход на S3-first. `GET /api/reports` теперь отдаёт JSON-конверт
+- **MinIO** - S3-совместимое хранилище, образ `cr.yandex/mirror/minio/minio:latest`.
+- **report-api** - переход на S3-first. `GET /api/reports` теперь отдаёт JSON-конверт
   `{"report_url", "from", "to", "data_available_until", "cached"}`; сам JSON отчёта фронтенд
   добирает по `report_url` уже с CDN.
-- **CDN (nginx)** — порт 8088, конфиги в папке `nginx/` (`nginx.conf` +
+- **CDN (nginx)** - порт 8088, конфиги в папке `nginx/` (`nginx.conf` +
   `conf.d/bionicpro-cdn.conf`). Reverse proxy на MinIO в path-style: URL
   `http://localhost:8088/reports/…` проходит «как есть» в `http://minio:9000/reports/…`
   (бакет = `reports`). Включён `proxy_cache` на диске (volume `cdn-cache`),
-  `X-Cache: HIT/MISS` для проверки. CORS — на стороне CDN: nginx отражает
+  `X-Cache: HIT/MISS` для проверки. CORS - на стороне CDN: nginx отражает
 
 ### Структура ключей в S3 (быстрый доступ)
 
@@ -223,15 +223,15 @@ reports/{email}/g{поколение ETL}/{от}_{до}.json
 ```
 
 Ключ детерминирован (O(1) GET/HEAD, без листинга бакета); email-префикс даёт аудит и
-разделение по пользователю; «поколение» — версионность (см. ниже).
+разделение по пользователю; «поколение» - версионность (см. ниже).
 
 ### Механизм обновления кеша
 
 - **Версионирование по ETL-поколению.** «Поколение» = дата watermark, до которой Airflow
   обработал данные. report-api всегда строит ключ от **текущего** поколения, поэтому при
   hit по S3 нельзя отдать устаревший отчёт. Когда Airflow сдвигает watermark, ключ
-  меняется, отчёт пересобирается под новым URL — старый кеш становится просто неиспользуемым.
-- **Очистка.** Старые поколения в бакете удаляет ILM-правило MinIO (30 дней); в кеше nginx —
+  меняется, отчёт пересобирается под новым URL - старый кеш становится просто неиспользуемым.
+- **Очистка.** Старые поколения в бакете удаляет ILM-правило MinIO (30 дней); в кеше nginx -
   TTL 24h + `proxy_cache_use_stale` как страховка. В реальном CDN инвалидация делалась бы
   через API (CloudFront invalidation / PURGE-запрос); в эмуляции версионируемые URL
   дают тот же эффект без доп. инфраструктуры.
@@ -244,5 +244,40 @@ ReportPage получает конверт, затем `fetch(report_url)` с CD
 сохранён в S3» (miss) + статус `X-Cache` и ссылка на CDN.
 
 
+## Задание 4 - CDC данных CRM в ClickHouse
+
+См. [task4-cdc.drawio](task4-cdc.drawio). Цель: CRM-данные (клиенты, протезы) должны
+попадать в ClickHouse не ежедневным снимком из Airflow, а потоком изменений (Change Data
+Capture). Тогда изменения CRM (новый клиент, новый протез, смена имени) отражаются в
+витрине без ожидания следующего ETL, а транзакционные операции CRM не нагружаются
+массовыми SELECT'ами.
 
 
+### Как проверить (живые проверки)
+
+- коннектор `bionicpro-crm` в статусе `RUNNING`, слот и publication `bionicpro_cdc`
+  активны, снапшот в топиках (8 клиентов, 5 протезов), зеркала в ClickHouse совпадают
+  с источником, `system.kafka_consumers` - ноль исключений;
+- `UPDATE` в CRM → новые значения появляются в зеркалах **и в витрине** за секунды,
+  без запуска ETL (проверяли телефон и ФИО, с откатом);
+- `INSERT` нового клиента → строка в зеркале (`deleted = 0`); `DELETE` → tombstone
+  `deleted = 1`, активных клиентов снова 8;
+- ручной запуск DAG: `report_prosthesis_daily_v2` заполнена (5 протезов × 76 дней =
+  380 строк), `etl_watermark` сдвинут;
+- report-api: `prothetic1` - 200, полный отчёт через CDN; `user1` - 200, пустой список
+  протезов; `admin1` - 404 `customer_not_found`.
+
+### Ограничения
+
+- Удаление строки в CRM попадает в зеркало сразу (`deleted = 1`), а из витрины
+  вычищается только на следующем ежедневном refresh (пересборка
+  `report_v2_mv_refresh` + `ALTER DELETE`). Любые изменения CRM (обновления, новые
+  протезы) в витрине отражаются сразу.
+- «Холодный старт»: снапшот Debezium с `initial` попадает в топики «как новые данные»,
+  и ClickHouse читает его одним проходом - работает, если топики были пусты. При
+  миграции поверх уже заполненных топиков нужно один раз сбросить офсеты группы
+  `ch-cdc` в `earliest`, чтобы снапшот был прочитан.
+
+## Финальный результат
+
+[Скриншот из ЛК](./final-result-sreenshot.png)
